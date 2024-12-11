@@ -65,61 +65,6 @@ df <-
   pivot_wider(names_from = "rep", values_from = "value") %>% 
   group_by(sample_origin) %>% 
   mutate(peak_number = row_number())
-# 
-# 
-# index = 1
-# x = df
-# get_rep_cor_ratios <- function(index, x){
-#   rep1_peak <- (x %>% filter(peak_number == index) %>% pull(rep1))+1
-#   rep2_peak <- (x %>% filter(peak_number == index) %>% pull(rep2))+1
-#   
-#   info <- x %>% select(peak_number, sample_origin)
-#   
-#   x %>% 
-#     filter(peak_number > index) %>% 
-#     group_by(peak_number) %>% 
-#     reframe(
-#       rep1 = rep1 / (rep1_peak),
-#       rep2 = rep2 / (rep2_peak)) %>% 
-#     group_by(peak_number) %>% 
-#     summarise(correlation = cor(rep1, rep2, method = "spearman")) %>% 
-#     filter(correlation > 0.5)
-# }
-# 
-# df <- df %>% ungroup()
-# 
-# result <- 
-#   df %>% 
-#   ungroup() %>% 
-#   group_by(peak_number) %>% 
-#   reframe(correlation = get_rep_cor_ratios(peak_number, df))
-# 
-# ratios_of_interest <- 
-#   result %>% 
-#   unnest() %>% 
-#   filter(correlation > 0.98) %>% 
-#   mutate(numerator = df$name[peak_number1], denumerator = df$name[peak_number])
-# 
-# values <- ms$values0
-# cc <- 
-#   as.list(1:nrow(ratios_of_interest)) %>% 
-#   map(~{
-#     print(.x)
-#     name1 = ratios_of_interest$numerator[.x]
-#     name2 = ratios_of_interest$denumerator[.x]
-#     # output = tibble(values[[name1]]/(values[[name2]]+1))
-#     # colnames(output) <- paste0(name1, "_", name2)
-#     values[[name1]]/(values[[name2]]+1)
-#     }) %>% 
-#   map(as_tibble) %>% 
-#   imap_dfc(~{
-#     colnames(.x) <- paste0(ratios_of_interest$numerator, "_", ratios_of_interest$denumerator)[.y]
-#     .x
-#     })
-# 
-# # 
-# ms$rowinfo0
-# ms$values_ratios <- cc
 
 # Plot PCA
 
@@ -137,18 +82,6 @@ ggsave(plot = ms0_pca,
        filename = paste0("/data/projects/osteoporosis_metabolomics/johan/figures/figureS2_transformed_pca_", filename, ".pdf"),
        bg = "white",width = 183, height = 150, units = "mm")
 
-
-# (ms_ratios_pca <- 
-#     plot_pca(
-#       feature_matrix = ms$values_ratios, 
-#       metadata = ms$rowinfo, 
-#       color_labels = c("batch", "storage_time", "region"), 
-#       palette = c("Set1", "YlOrRd", "Set1"))
-# )
-# 
-# ggsave(plot = ms0_pca, 
-#        filename = paste0("/data/projects/osteoporosis_metabolomics/johan/figures/figureS2_transformed_pca_", filename, ".pdf"),
-#        bg = "white",width = 183, height = 150, units = "mm")
 
 tmp2 <- ms$rowinfo0 %>% filter(grepl("sample_rep", type2))
 tmp1 <- ms$values0[tmp2$rowid,]

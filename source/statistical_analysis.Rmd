@@ -1,0 +1,970 @@
+---
+title: "statistical_analysis"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Load libraries
+```{r}
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(pROC)
+library(cli)
+library(lightgbm)
+setwd("/data/projects/osteoporosis_metabolomics/johan/")
+source("~/osteoporosis_metabolomics/utils.R")
+
+```
+
+
+# Read and combined positive and negative ionization data
+
+
+```{r}
+ms1 <- read_rds("/data/projects/osteoporosis_metabolomics/johan/ml_preprocessed_msobject.rds")
+ms2 <- read_rds("/data/projects/osteoporosis_metabolomics/johan/ml_preprocessed_msobject_neg.rds")
+
+ms_pos <- ms1$i %>% bind_cols(ms1$v2)
+ms_neg <- ms2$i %>% bind_cols(ms2$v2) %>% filter(rowid != 257) %>% mutate(rowid = row_number())
+ms_pos <- ms_pos %>% arrange(match(ms_neg$sample_id, ms_pos$sample_id))
+```
+
+##  model
+
+## Visualizing replicate feature correlations before and after preprocessing
+
+```{r}
+if (!file.exists("~/osteoporosis_metabolomics/models/ms_fits_simple_glmnet.rds") |
+    !file.exists("~/osteoporosis_metabolomics/models/ms_fits_simple_ranger.rds") |
+    !file.exists("~/osteoporosis_metabolomics/models/ms_fits_slope_glmnet.rds" ) |
+    !file.exists("~/osteoporosis_metabolomics/models/ms_fits_slope_ranger.rds" )){
+  ms_fits_simple_glmnet <- 
+    list(ms_neg, ms_pos) %>% 
+    map(fit, objective = "simple", cv_method = "sample_origin", method = "glmnet", tuneLength = 5)
+  
+  ms_fits_slope_glmnet <- 
+    list(ms_neg, ms_pos) %>% 
+    map(fit, objective = "slope", cv_method = "loocv", method = "glmnet", tuneLength = 5)
+  
+  ms_fits_simple_ranger <- 
+    list(ms_neg, ms_pos) %>% 
+    map(fit, objective = "simple", cv_method = "sample_origin", method = "ranger", tuneLength = 5)
+  
+  ms_fits_slope_ranger <- 
+    list(ms_neg, ms_pos) %>% 
+    map(fit, objective = "slope", cv_method = "loocv", method = "ranger", tuneLength = 5)
+} else {
+    ms_fits_simple_glmnet <- readr::read_rds("~/osteoporosis_metabolomics/models/ms_fits_simple_glmnet.rds")
+    ms_fits_slope_glmnet  <- readr::read_rds("~/osteoporosis_metabolomics/models/ms_fits_slope_glmnet.rds")
+    ms_fits_simple_ranger <- readr::read_rds("~/osteoporosis_metabolomics/models/ms_fits_simple_ranger.rds" )
+    ms_fits_slope_ranger  <- readr::read_rds("~/osteoporosis_metabolomics/models/ms_fits_slope_ranger.rds" )
+}
+
+ms_preds_glmnet <- 
+  c(ms_fits_simple_glmnet, ms_fits_slope_glmnet) %>% 
+  get_best_glmnet_preds %>% 
+  set_names(c("simple_neg", "simple_pos", "slope_neg", "slope_pos"))
+
+ms_preds_ranger <- 
+  c(ms_fits_simple_ranger, ms_fits_slope_ranger) %>% 
+  get_best_ranger_preds %>% 
+  set_names(c("simple_neg", "simple_pos", "slope_neg", "slope_pos"))
+```
+
+# Model performance
+```{r}
+ms_preds_glmnet %>% 
+  map(~{confusionMatrix(.x$pred, .x$obs, mode = "prec_recall")})
+
+ms_preds_ranger %>% 
+  map(~{confusionMatrix(.x$pred, .x$obs, mode = "prec_recall")})
+
+ms_preds_glmnet %>% 
+  map_dbl(~pROC::roc(.x$obs, .x$case)$auc[[1]]) 
+
+ms_preds_ranger %>% 
+  map_dbl(~pROC::roc(.x$obs, .x$case)$auc[[1]]) 
+
+```
+
+
+```{r}
+
+if (!file.exists("./ms_simple_permuted_loocv.rds")){
+  ms_simple_permuted <- 
+    list(ms_neg) %>% 
+    map(fit, permute = T, permutations = 10, method = "glmnet", objective = "simple")
+
+  readr::write_rds(ms_simple_permuted, "./ms_simple_permuted_loocv.rds")
+} else{
+  ms_simple_permuted <- readr::read_rds("./ms_simple_permuted_loocv.rds")
+}
+```
+
+
+```{r}
+prediction_both_models <- ms_preds_glmnet %>% 
+  set_names(c("Negative_Latest Sample", "Positive_Latest Sample", "Negative_Slope", "Positive_Slope"))
+
+permutation <- readr::read_rds("./ms_simple_permuted_loocv.rds")
+
+glmnet_result <- model_result(prediction_both_models = prediction_both_models, permutation = permutation)
+
+ggsave(filename = "~/osteoporosis_metabolomics/export/figure2ab.pdf",
+       plot=glmnet_result,
+       bg = "white", width = 183, height = 100, units = "mm")
+
+
+prediction_both_models <- ms_preds_ranger %>% 
+  set_names(c("Negative_Latest Sample", "Positive_Latest Sample", 
+              "Negative_Slope", "Positive_Slope"))
+
+
+ranger_result <- model_result(prediction_both_models = prediction_both_models, permutation = permutation)
+
+```
+
+
+save the plotting data for extended data
+```{r}
+prediction_both_models <- ms_preds_glmnet
+
+names(prediction_both_models) <- c("Latest_Negative", "Latest_Positive", "Slope_Negative", "Slope_Positive")
+
+ms_permuted <- readr::read_rds("./ms_slope_permuted_loocv.rds")
+
+HA_ROC <- 
+  prediction_both_models %>% 
+  map(~pROC::roc(.x$obs, .x$case, )) %>% 
+  map(~{pROC:::get.coords.for.ggplot(.x) %>% as_tibble()}) %>% 
+  bind_rows(.id = "dataset") %>% 
+  mutate(Ionization = strsplit(dataset, "_") %>% map_chr(2),
+         method = strsplit(dataset, "_") %>% map_chr(1))
+
+HA_ROC %>% 
+  write_csv("~/osteoporosis_metabolomics/export/HA_ROC.csv")
+
+
+H0_ROC <- 
+  ms_permuted[[1]] %>% 
+      map(~.x$pred %>% filter(alpha==.x$bestTune$alpha, lambda==.x$bestTune$lambda)) %>% 
+      map(~arrange(.x, rowIndex)) %>% 
+      map(~pROC::roc(.x$obs, .x$case, )) %>% 
+      map_dfr(pROC:::get.coords.for.ggplot) %>% 
+      as_tibble() %>% 
+      group_by(`1-specificity`) %>% 
+      summarise(
+        sens_mean = mean(sensitivity),
+        upper = sens_mean+1.96*sqrt((sens_mean*(1-sens_mean))/length(ms_permuted[[1]])),
+        lower = sens_mean-1.96*sqrt((sens_mean*(1-sens_mean))/length(ms_permuted[[1]])),
+        sens_lower = quantile(sensitivity, 0.05),
+        sensitivity = quantile(sensitivity, 0.95))
+
+H0_ROC %>% 
+  write_csv("~/osteoporosis_metabolomics/export/H0_ROC.csv")
+
+```
+
+
+# Technical validation
+```{r}
+
+ms_slope_fits_batch_val_glmnet <- 
+  list(ms_neg, ms_pos)  %>% 
+  map(fit, objective = "slope", cv_method = "batch", method = "glmnet")
+
+ms_slope_fits_batch_val_ranger <- 
+  list(ms_neg, ms_pos)  %>% 
+  map(fit, objective = "slope", cv_method = "batch", method = "ranger")
+
+ms_slope_permute_batch_val_glmnet <- 
+  list(ms_neg, ms_pos)  %>% 
+  map(fit, objective = "slope", permute = T, permutations = 100, cv_method = "batch", method = "glmnet")
+
+
+ms_slope_fits_batch_val_glmnet %>% 
+  get_best_glmnet_preds() %>% 
+  map_dbl(~pROC::roc(.x$obs, .x$case)$auc[[1]]) 
+
+ms_slope_fits_batch_val_ranger %>% 
+  get_best_ranger_preds() %>% 
+  map_dbl(~pROC::roc(.x$obs, .x$case)$auc[[1]]) 
+  
+```
+
+```{r}
+models <- c(ms_slope_fits_batch_val_glmnet %>% get_best_glmnet_preds(),
+            ms_slope_fits_batch_val_ranger %>% get_best_ranger_preds()) %>% 
+  set_names(c("Negative_Elastic Net", "Positive_Elastic Net",
+              "Negative_Random Forest", "Positive_Random Forest")
+              )
+
+hold_one_batch_out <- 
+  model_result(models, ms_slope_permute_batch_val_glmnet)
+
+ggsave(hold_one_batch_out, filename = "./figures/supplementary_figure_lobathco.pdf", width = 180, height = 60, units = "mm", bg="white")
+
+```
+
+
+# Jackknife analysis
+
+* Robustness of the features
+* Significance of the models (glmnet slope)
+
+```{r}
+longitudinal_samples <- 
+  ms_neg %>% 
+  filter(!is.na(group)) %>% 
+  group_by(group) %>% 
+  mutate(n=n()) %>% 
+  ungroup() %>% 
+  filter(n>4) %>% 
+  select(-n) %>% 
+  mutate(id =  paste0(group, status)) %>% 
+  pull(id) %>% 
+  unique()
+
+if (!file.exists("~/osteoporosis_metabolomics/jackknifed_models.rdata")){
+
+    
+  make_ms_slope_fits <- 
+    function(exclusion_sample, 
+             exclusion_variable = "none",
+             method = "glmnet") list(ms_neg, ms_pos) %>%
+    map(fit_slope, 
+        cv_method = "loocv", 
+        method = "glmnet",
+        exclude_sample = exclusion_sample,
+        exclude_variable = exclusion_variable)
+  
+  
+  jackknife_slope_models <- 
+    longitudinal_samples %>% 
+    map(make_ms_slope_fits, .progress=TRUE)
+  
+  readr::write_rds(file = "~/osteoporosis_metabolomics/jackknifed_models.rdata", jackknife_slope_models)
+} else {
+  jackknife_slope_models <- readr::read_rds("~/osteoporosis_metabolomics/jackknifed_models.rdata")
+}
+
+
+```
+
+### Finding robustness of feature selection
+
+```{r}
+neg_jk_models <- jackknife_slope_models %>% map(1)
+
+feature_importance_neg <- 
+  neg_jk_models %>% 
+  map(caret::varImp) %>% 
+  map(~ as_tibble(.x[[1]], rownames = "feature")) %>% 
+  bind_rows(.id = "index")%>% 
+  mutate(sample = longitudinal_samples[as.integer(index)])
+
+features_selected_neg <- 
+  feature_importance_neg %>% 
+  group_by(feature) %>% 
+  summarise(feature_mean = mean(Overall)) %>% 
+  arrange(-feature_mean)
+
+
+pos_jk_models <- jackknife_slope_models %>% map(2)
+
+
+feature_importance_pos <- 
+  pos_jk_models %>% 
+  map(caret::varImp) %>% 
+  map(~ as_tibble(.x[[1]], rownames = "feature")) %>% 
+  bind_rows(.id = "index") %>% 
+  mutate(sample = longitudinal_samples[as.integer(index)])
+
+
+features_selected_pos <- 
+  feature_importance_pos %>% 
+  group_by(feature) %>% 
+  summarise(feature_mean = mean(Overall)) %>% 
+  arrange(-feature_mean)
+
+
+```
+
+```{r}
+feature_importance_neg %>% 
+  group_by(feature) %>% 
+  summarize(Overall = mean(Overall)) %>% 
+  arrange(-Overall) %>% 
+  write_csv("~/osteoporosis_metabolomics/export/feature_importance_neg.csv")
+
+feature_importance_pos %>% 
+  group_by(feature) %>% 
+  summarize(Overall = mean(Overall)) %>% 
+  arrange(-Overall) %>% 
+  write_csv("~/osteoporosis_metabolomics/export/feature_importance_pos.csv")
+```
+
+
+
+### Predict hold-out samples on Random Forest (suggested by reviewer - not included in study)
+```{r}
+
+rf_ms_slope_fits <- 
+  function(
+    ms,
+    exclude_samples = "none",
+    exclude_features = "none",
+    method = "glmnet"){
+    
+    list(ms) %>%
+      map(fit, 
+      cv_method = "loocv", 
+      objective = "slope",
+      method = method,
+      exclude_samples = exclude_samples,
+      exclude_features = exclude_features)
+  }
+
+
+if (!file.exists("~/osteoporosis_metabolomics/rf_neg_feature_selected.rdata")){
+  neg_revision_analysis <-
+  as.list(longitudinal_samples) %>%
+  map(~feature_importance_neg %>% filter(sample %in% .x)) %>%
+  map(filter, Overall == 0) %>%
+  map(~{rf_ms_slope_fits(
+    ms = ms_neg,
+    exclude_samples = .x$sample[1], 
+    exclude_features= .x$feature, 
+    method = "ranger")},
+    .progress = TRUE)
+
+readr::write_rds(file = "~/osteoporosis_metabolomics/rf_neg_feature_selected.rdata", neg_revision_analysis)
+
+}else{
+  neg_revision_analysis <- readr::read_rds("~/osteoporosis_metabolomics/rf_neg_feature_selected.rdata")
+}
+
+if (!file.exists()){
+  pos_revision_analysis <- 
+  as.list(longitudinal_samples) %>% 
+  map(~feature_importance_pos %>% filter(sample %in% .x)) %>% 
+  map(filter, Overall == 0) %>% 
+  map(~{rf_ms_slope_fits(
+    ms = ms_pos,
+    exclusion_sample = .x$sample[1], 
+    exclusion_variable=.x$feature, 
+    method = "ranger")},
+    .progress = TRUE)
+
+ readr::write_rds(file = "~/osteoporosis_metabolomics/rf_pos_feature_selected.rdata", pos_revision_analysis)
+
+} else {
+ pos_revision_analysis <- readr::read_rds("~/osteoporosis_metabolomics/rf_pos_feature_selected.rdata") 
+}
+```
+
+
+```{r}
+ms <- ms_neg
+rowinfo <- ms %>% select(!starts_with("M"))
+values <- ms %>% select(starts_with("M"), -MCS)
+  
+tmp1 <- 
+  rowinfo %>% 
+  filter(!is.na(group)) %>% 
+  group_by(group) %>% 
+  mutate(n=n()) %>% 
+  ungroup() %>% 
+  filter(n>4) %>% 
+  select(-n)
+
+tmp2 <- values[tmp1$rowid,]
+tmp2 <- tmp2[,tmp2 %>% map_lgl(~sum(is.na(.x))==0)]
+
+try2 <- 
+  tmp1 %>% 
+  select(group, time_point = age_at_donation, rowid, status, batch) %>% 
+  bind_cols(tmp2) %>%
+  select(-rowid) %>% 
+  pivot_longer(cols = -c(group, time_point, status, batch)) %>%
+  group_by(group, status, name) %>% 
+  mutate(value = scale(value)) %>% 
+  summarise(
+    batch = batch[1],
+    metric = sum((time_point-mean(time_point, na.rm = T))*(value-mean(value, na.rm = T)))/(sum((time_point-mean(time_point, na.rm = T))^2, na.rm = T))
+  ) %>% ungroup() %>% 
+  pivot_wider(names_from = name, values_from = metric) %>% 
+  ungroup()
+
+
+names(neg_revision_analysis) <- longitudinal_samples
+
+neg_hold_out_predictions_random_forest <- 
+  longitudinal_samples %>% 
+  map(~{
+    x <- try2 %>% filter(paste0(group, status)==.x) %>% select(starts_with("M"))
+    x <- x[(x %>% map(is.na) %>% map_dbl(sum))==0] %>%
+      select(any_of(colnames(neg_revision_analysis[[.x]][[1]]$trainingData)))
+    predict(neg_revision_analysis[[.x]][[1]], newdata = x, type = "prob")[1,]
+  }) %>% 
+  unlist() #%>% as.factor()
+
+neg_revision_analysis %>% 
+  map(~.x[[1]]$pred %>% as_tibble() %>% filter(mtry == .x[[1]]$bestTune$mtry, splitrule == .x[[1]]$bestTune$splitrule)) %>% 
+  map_dbl(~pROC::roc(.x$obs, .x$case)$auc[[1]]) %>% mean()
+
+
+# Performance when using a two-step approach (first feature selection, then re-training on selected features)
+pROC::roc(as.factor(names(neg_hold_out_predictions_random_forest)), as.numeric(neg_hold_out_predictions_random_forest))
+
+```
+
+
+### Positive ESI two step performance
+
+```{r}
+ms <- ms_pos
+rowinfo <- ms %>% select(!starts_with("M"))
+values <- ms %>% select(starts_with("M"), -MCS)
+  
+tmp1 <- 
+  rowinfo %>% 
+  filter(!is.na(group)) %>% 
+  group_by(group) %>% 
+  mutate(n=n()) %>% 
+  ungroup() %>% 
+  filter(n>4) %>% 
+  select(-n)
+
+tmp2 <- values[tmp1$rowid,]
+tmp2 <- tmp2[,tmp2 %>% map_lgl(~sum(is.na(.x))==0)]
+
+try2 <- 
+  tmp1 %>% 
+  select(group, time_point = age_at_donation, rowid, status, batch) %>% 
+  bind_cols(tmp2) %>%
+  select(-rowid) %>% 
+  pivot_longer(cols = -c(group, time_point, status, batch)) %>%
+  group_by(group, status, name) %>% 
+  mutate(value = scale(value)) %>% 
+  summarise(
+    batch = batch[1],
+    metric = sum((time_point-mean(time_point, na.rm = T))*(value-mean(value, na.rm = T)))/(sum((time_point-mean(time_point, na.rm = T))^2, na.rm = T))
+  ) %>% ungroup() %>% 
+  pivot_wider(names_from = name, values_from = metric) %>% 
+  ungroup()
+
+
+names(pos_revision_analysis) <- longitudinal_samples
+
+predict(pos_revision_analysis[["28ctrl"]][[1]], newdata = x)
+
+pos_hold_out_predictions_random_forest <- 
+  longitudinal_samples %>% 
+  map(~{
+    x <- try2 %>% filter(paste0(group, status)==.x) %>% select(starts_with("M"))
+    x <- x[(x %>% map(is.na) %>% map_dbl(sum))==0] %>%
+      select(any_of(colnames(pos_revision_analysis[[.x]][[1]]$trainingData)))
+    predict(pos_revision_analysis[[.x]][[1]], newdata = x)
+  }) %>% 
+  unlist() %>% 
+  as.factor()
+
+caret::confusionMatrix(pos_hold_out_predictions_random_forest, as.factor(gsub('[[:digit:]]+', '', longitudinal_samples)))
+
+```
+
+
+
+
+# Get p-values for jackknife vs permutation
+```{r}
+ms_slope_permuted <- readr::read_rds("~/osteoporosis_metabolomics/models/ms_slope_permuted_loocv.rds")
+
+neg_perm_auc <- 
+  c(ms_slope_permuted[[1]],ms_slope_permuted[[2]])  %>% 
+  get_best_glmnet_preds() %>% 
+  map_dbl(~pROC::roc(.x$obs, .x$case)$auc[[1]])
+
+ha_neg <- 
+  jackknife_slope_models %>%
+  map(1) %>% 
+  get_best_glmnet_preds() %>% 
+  map_dbl(~pROC::roc(.x$obs, .x$case)$auc[[1]])
+
+ha_pos <- 
+  jackknife_slope_models %>%
+  map(2) %>% 
+  get_best_glmnet_preds() %>% 
+  map_dbl(~pROC::roc(.x$obs, .x$case)$auc[[1]])
+
+sam <- sample(1:length(neg_perm_auc), size=78)
+mean(neg_perm_auc[sam])-1.96*(sd(neg_perm_auc[sam])/sqrt(78))
+mean(neg_perm_auc[sam])+1.96*(sd(neg_perm_auc[sam])/sqrt(78))
+
+mean(ha_neg)-1.96*(sd(ha_neg)/sqrt(78))
+mean(ha_neg)+1.96*(sd(ha_neg)/sqrt(78))
+mean(ha_neg)
+
+mean(ha_pos)-1.96*(sd(ha_pos)/sqrt(78))
+mean(ha_pos)+1.96*(sd(ha_pos)/sqrt(78))
+mean(ha_pos)
+
+t.test(x=neg_perm_auc[sam], y=ha_pos)
+t.test(x=neg_perm_auc[sam], y=ha_neg)
+
+```
+
+
+# Make slope PCA plots
+
+```{r}
+  
+################### Slopes #################
+slopes <- 
+  list("neg"=ms_neg, "pos"=ms_pos) %>% 
+  map(make_slopes)
+
+
+source("/data/projects/osteoporosis_metabolomics/johan/scripts/markdown/preprocessing_utils.R")
+
+pca_out_neg <- plot_pca(slopes[[1]]$values, slopes[[1]]$rowinfo, color_labels = c("status", "batch"), palette = c("Set1", "Set1"))
+
+ggsave(filename = "/data/projects/osteoporosis_metabolomics/johan/figures/figure1_pca_slopes_neg.pdf",
+       plot=pca_out_neg,
+       bg = "white", width = 183, height = 100, units = "mm")
+
+
+pca_out_pos <- plot_pca(slopes[[2]]$values, slopes[[2]]$rowinfo, color_labels = c("status", "batch"), palette = c("Set1", "Set1"))
+ggsave(filename = "/data/projects/osteoporosis_metabolomics/johan/figures/figure1_pca_slopes_pos.pdf",
+       plot=pca_out_pos,
+       bg = "white", width = 183, height = 100, units = "mm")
+
+
+################### all samples ###################
+x <- ms_neg %>% select(starts_with("M"))
+x <- x[(x %>% map(is.na) %>% map_dbl(sum))==0]
+pca_out_neg_simple <- plot_pca(x, 
+                        ms_neg %>% select(-starts_with("M")), color_labels = c("status", "batch"), palette = c("Set1", "Set1"))
+
+r    <- prcomp(x = x, retx = TRUE, center = T, scale = T, rank. = 4*2)
+r$x %>% 
+  as_tibble() %>% 
+  mutate(status = ms_neg$status) %>% 
+  write_csv("~/osteoporosis_metabolomics/export/extended_data_plot1_PCA_neg.csv")
+
+pca_out_neg_simple$data
+
+ggsave(filename = "/data/projects/osteoporosis_metabolomics/johan/figures/figure1_pca_simple_neg.pdf",
+       plot=pca_out_neg_simple,
+       bg = "white", width = 183, height = 100, units = "mm")
+
+
+
+x <- ms_pos %>% select(starts_with("M"))
+x <- x[(x %>% map(is.na) %>% map_dbl(sum))==0]
+pca_out_pos_simple <- plot_pca(x, 
+                        ms_pos %>% select(-starts_with("M")), color_labels = c("status", "batch"), palette = c("Set1", "Set1"))
+
+ggsave(filename = "/data/projects/osteoporosis_metabolomics/johan/figures/figure1_pca_simple_pos.pdf",
+       plot=pca_out_pos_simple,
+       bg = "white", width = 183, height = 100, units = "mm")
+
+```
+
+
+
+# boxplots
+
+```{r}
+
+pos_features <- 
+  c("M328.032T305.074", 
+    "M297.107T53.58", 
+    "M490.149T372.595", 
+    "M586.43T746.919", 
+    "M326.123T126.859")
+
+neg_features <- 
+  c("M515.284T470.37",
+    "M320.993T304.505",
+    "M169.087T413.776",
+    "M227.983T37.03",
+    "M363.18T494.785")
+
+features <- list(neg_features, pos_features)
+
+
+boxplot_data <- 
+  slopes[[1]]$values %>% 
+    select(all_of(neg_features))%>%
+    bind_cols(slopes[[1]]$rowinfo) %>% 
+    select(-batch) %>% 
+    pivot_longer(cols = starts_with("M")) %>% 
+  mutate(ionization = "Negative") %>% 
+  bind_rows(
+slopes[[2]]$values %>% 
+    select(all_of(pos_features))%>%
+    bind_cols(slopes[[2]]$rowinfo) %>% 
+    select(-batch) %>% 
+    pivot_longer(cols = starts_with("M")) %>% 
+  mutate(ionization = "Positive")
+  ) %>% 
+  mutate(name = factor(name, levels = c(neg_features, pos_features))) 
+
+boxplot_data <- 
+  boxplot_data %>% 
+  mutate(
+    Feature = case_when(
+      grepl("M328.032T305.074", name)~"Hippuric Acid",
+      grepl("M297.107T53.58",   name)~"Tyrosyl-aspartate",
+      grepl("M490.149T372.595", name)~"M490.149T372.595",
+      grepl("M586.43T746.919",  name)~"M586.43T746.919",
+      grepl("M326.123T126.859", name)~"N-fructosyl tyrosine",
+      grepl("M515.284T470.37",  name)~"Dodecanedioic Acid",
+      grepl("M320.993T304.505", name)~"Hippuric Acid",
+      grepl("M169.087T413.776", name)~"Azelaic Acid",
+      grepl("M227.983T37.03",   name)~"M227.983T37.03",
+      grepl("M363.18T494.785",  name)~"M363.18T494.785"
+    )
+  ) %>% select(-name)
+
+boxplot_data %>% 
+  write_csv("~/osteoporosis_metabolomics/export/extended_data_plot2_boxplot.csv")
+
+boxplot_data %>% 
+  ggplot(aes(x=Feature, y=value, fill = status))+
+  geom_hline(yintercept = 0, linetype=21)+
+  geom_boxplot()+
+  facet_wrap(~ionization, scales = "free")+
+  scale_fill_brewer(palette = "Set1")+
+  theme_minimal()+
+  theme(
+    axis.title.x = element_text(size = 7),
+    axis.title.y = element_text(size = 7),
+    axis.text.y = element_text(size = 7),
+    legend.text = element_text(size = 7),
+    legend.title = element_text(size=7),
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 7)
+  )
+
+
+ggsave(filename = "/data/projects/osteoporosis_metabolomics/johan/figures/figure2_important_slopes_boxplots.pdf",
+       plot=boxplots,
+       bg = "white", width = 183, height = 90, units = "mm")
+
+
+```
+
+# Logistic regressions of top predictors
+```{r}
+
+
+get_single_feature_roc <- 
+  function(info){
+    ion <- gsub("_.*", "", info)
+    feature <- gsub(".*_", "", info)
+    data = slopes[[ion]] %>% bind_cols() %>% mutate(y= as.numeric(factor(status))-1)
+    model <- glm(y ~ data[[feature]], data = data, family = binomial) 
+    data$prob <- predict(model, type = "response")
+    roc_obj <- roc(data$y, data$prob)
+    print(info)
+    print(roc_obj)
+    roc_data <- data.frame(
+      TPR = roc_obj$sensitivities, # True Positive Rate 
+      FPR = 1 - roc_obj$specificities # False Positive Rate
+      )
+    
+    roc_data <- 
+      pROC:::get.coords.for.ggplot(roc_obj) %>%
+      as_tibble() #%>% 
+    
+    return(roc_data)
+  }
+
+feature_ion_combination <- c(
+  paste0(rep("pos_", length(pos_features)),pos_features),
+  paste0(rep("neg_", length(neg_features)),neg_features)
+)
+
+roc_single_feature <- 
+  feature_ion_combination %>% 
+  map(get_single_feature_roc) %>% 
+  set_names(feature_ion_combination) %>% 
+  bind_rows(.id = "id") %>% 
+  mutate(
+    Ionization = ifelse(grepl("pos", id), "Positive Ionization", "Negative Ionization"),
+    Feature = case_when(
+      grepl("M328.032T305.074", id)~"Hippuric Acid",
+      grepl("M297.107T53.58", id)~"Tyrosyl-aspartate",
+      grepl("M490.149T372.595", id)~"M490.149T372.595",
+      grepl("M586.43T746.919", id)~"M586.43T746.919",
+      grepl("M326.123T126.859", id)~"M326.123T126.859",
+      grepl("M515.284T470.37", id)~"Dodecanedioic Acid",
+      grepl("M320.993T304.505", id)~"Hippuric Acid",
+      grepl("M169.087T413.776", id)~"Azelaic Acid",
+      grepl("M227.983T37.03", id)~"M227.983T37.03",
+      grepl("M363.18T494.785", id)~"M363.18T494.785"
+    )
+  )
+
+
+negative <- 
+  roc_single_feature %>% 
+  filter(Ionization == "Negative Ionization") %>% 
+  ggplot(aes(x = `1-specificity`, y = sensitivity)) + 
+  geom_line() + 
+  geom_abline(linetype = "dashed") + 
+  labs(x = " ", y = "sensitivity (TPR)") + 
+  theme_minimal()+
+  facet_grid(Ionization~Feature, scales = "free") +
+    ggplot2::theme(axis.title.x = element_text(size = 7),
+                   axis.title.y = element_text(size = 7),
+                   axis.text.x = element_text(size = 7),
+                   axis.text.y = element_text(size = 7),
+                   legend.text = element_text(size = 7),
+                   legend.title = element_text(size=7))
+
+positive <-
+  roc_single_feature %>% 
+  filter(Ionization == "Positive Ionization") %>% 
+  ggplot(aes(x = `1-specificity`, y = sensitivity)) + 
+  geom_line() + 
+  geom_abline(linetype = "dashed") + 
+  labs(x = "1-specificity (FPR)", y = "sensitivity (TPR)") + 
+  theme_minimal()+
+  facet_grid(Ionization~Feature, scales = "free") +
+    ggplot2::theme(axis.title.x = element_text(size = 7),
+                   axis.title.y = element_text(size = 7),
+                   axis.text.x = element_text(size = 7),
+                   axis.text.y = element_text(size = 7),
+                   legend.text = element_text(size = 7),
+                   legend.title = element_text(size=7))
+
+single_feature_rocs <- cowplot::plot_grid(negative, positive, ncol = 1)  
+ggsave(filename = "~/osteoporosis_metabolomics/export/single_feature_rocs.pdf",
+       plot=single_feature_rocs,
+       bg = "white", width = 200, height = 90, units = "mm")
+
+
+```
+
+
+
+# Figure 1 plot of individuals in PCA
+
+```{r}
+set.seed(2)
+x <- ms_pos %>% select(starts_with("M"))
+x <- x[(x %>% map(is.na) %>% map_dbl(sum))==0]
+y <- ms_pos %>% 
+  select(-starts_with("M"))
+
+group_counts = table(y$group) %>% sort()
+groups <- sample(names(group_counts[group_counts==12]), 3)
+person_filter <- y %>% filter(group %in% groups, status == "ctrl") %>% pull(cpr_enc)
+
+y <- y %>% 
+  mutate(sample_variance = ifelse(cpr_enc %in% person_filter, cpr_enc, "other"),
+         sample_variance = factor(sample_variance))
+
+indexer <- map_dbl(y$sample_variance, ~(which(.x == c(unique(person_filter), "other"))))
+names_of_samples <- c("1", "2", "3", "other")
+y$sample_variance <- factor(names_of_samples[indexer], levels = rev(names_of_samples))
+y$indexer <- indexer
+
+r    <- prcomp(x = x, retx = TRUE, center = T, scale = T, rank. = 6)
+variance_explained <- summary(r)$importance[2,1:(6*2)]
+variance_explained <- round(variance_explained, 3)*100
+
+variable_plotlist <- list()
+
+pd_pos <- 
+  r$x %>%
+  tibble::as_tibble() %>%
+  dplyr::bind_cols(y %>% dplyr::select(dplyr::all_of(c("time_point","sample_variance", "indexer", "status")))) %>%
+  {.}
+  
+plotlist <- list()
+
+for(i in 1:(ncol(r$x)/2)) {
+  
+  pd_pos <- pd_pos %>% arrange(-indexer)
+  
+  xvar <- names(pd_pos)[2*i-1]
+  yvar <- names(pd_pos)[2*i]
+  p1_pos <-
+    ggplot2::ggplot(pd_pos, ggplot2::aes(x=.data[[xvar]], y=.data[[yvar]], fill=sample_variance))+
+    ggplot2::geom_point(shape=21, color = "white", size=2, show.legend = F) +
+    ggplot2::geom_path(
+      data = 
+        pd_pos %>% 
+        filter(sample_variance != "other") %>% 
+        group_by(sample_variance) %>% 
+        arrange(time_point) %>% ungroup(),
+      aes(
+        x = .data[[xvar]], 
+        y = .data[[yvar]],
+        color = sample_variance),
+        show.legend = F) +#, color="black"
+    ggplot2::labs(fill = "Random donor", 
+                  x = paste0(xvar, " (", variance_explained[xvar], " %)"), 
+                  y = paste0(yvar, " (", variance_explained[yvar], " %)"))+
+    scale_color_manual(values = c("#e4211cff", "#4daf4aff", "#b250b5ff"))+
+    ggplot2::scale_fill_manual(values = c("#d9d9d9ff", "#e4211cff", "#4daf4aff", "#b250b5ff"))+
+    ggplot2::theme_minimal() +
+    ggplot2::theme(axis.title.x = element_text(size = 7),
+                   axis.title.y = element_text(size = 7),
+                   axis.text.x = element_text(size = 7),
+                   axis.text.y = element_text(size = 7),
+                   legend.text = element_text(size = 7),
+                   legend.title = element_text(size=7),
+                   panel.grid.major = element_blank(),
+                   panel.grid.minor = element_blank())+
+  guides(fill = guide_legend(reverse=TRUE))
+  
+  p2_pos <-
+    ggplot2::ggplot(pd_pos, ggplot2::aes(x=.data[[xvar]], y=.data[[yvar]], fill=status))+
+    ggplot2::geom_point(shape=21, color = "white", size=2, show.legend = T) +#, color="black"
+    ggplot2::labs(fill = "Status", 
+                  x = paste0(xvar, " (", variance_explained[xvar], " %)"), 
+                  y = paste0(yvar, " (", variance_explained[yvar], " %)"))+
+    ggsci::scale_fill_d3()+
+    ggplot2::theme_minimal() +
+    ggplot2::theme(axis.title.x = element_text(size = 7),
+                   axis.title.y = element_text(size = 7),
+                   axis.text.x = element_text(size = 7),
+                   axis.text.y = element_text(size = 7),
+                   legend.text = element_text(size = 7),
+                   legend.title = element_text(size=7),
+                   panel.grid.major = element_blank(),
+                   panel.grid.minor = element_blank())
+  
+  plotlist[[length(plotlist)+1]] <- p1_pos
+}
+
+p1 <- cowplot::plot_grid(plotlist = plotlist, nrow=1)
+p1 <- cowplot::plot_grid(p1)#, legend, rel_widths = c(3, .4))
+title <- cowplot::ggdraw() + cowplot::draw_label(paste("PCA based on", ncol(x), "Features"), size = 8)
+
+final <- cowplot::plot_grid(title, p1, nrow=2, rel_heights = c(1, 10))
+
+ggsave(filename = "/data/projects/osteoporosis_metabolomics/johan/figures/sample_variance_pos.pdf",
+       plot=final,
+       bg = "white", width = 183, height = 90, units = "mm")
+
+################## RUNNING NEGATIVE SAMPLES ####################
+
+
+x <- ms_neg %>% select(starts_with("M"))
+x <- x[(x %>% map(is.na) %>% map_dbl(sum))==0]
+y <- ms_neg %>% 
+  select(-starts_with("M"))
+
+group_counts = table(y$group) %>% sort()
+groups <- sample(names(group_counts[group_counts==12]), 3)
+person_filter <- y %>% filter(group %in% groups, status == "ctrl") %>% pull(cpr_enc)
+
+y <- y %>% 
+  mutate(sample_variance = ifelse(cpr_enc %in% person_filter, cpr_enc, "other"),
+         sample_variance = factor(sample_variance))
+
+indexer <- map_dbl(y$sample_variance, ~(which(.x == c(unique(person_filter), "other"))))
+names_of_samples <- c("1", "2", "3", "other")
+y$sample_variance <- factor(names_of_samples[indexer], levels = rev(names_of_samples))
+y$indexer <- indexer
+
+r    <- prcomp(x = x, retx = TRUE, center = T, scale = T, rank. = 6)
+variance_explained <- summary(r)$importance[2,1:(6*2)]
+variance_explained <- round(variance_explained, 3)*100
+
+pd_neg <- r$x %>%
+  tibble::as_tibble() %>%
+  dplyr::bind_cols(y %>% dplyr::select(dplyr::all_of(c("sample_variance", "indexer", "time_point", "status")))) %>%
+  {.}
+  
+plotlist <- list()
+
+for(i in 1:(ncol(r$x)/2)) {
+  
+  pd_neg <- pd_neg %>% arrange(-indexer)
+  
+  xvar <- names(pd_neg)[2*i-1]
+  yvar <- names(pd_neg)[2*i]
+  p1_neg <-
+    ggplot2::ggplot(pd_neg, ggplot2::aes(x=.data[[xvar]], y=.data[[yvar]], fill=sample_variance))+
+    ggplot2::geom_point(shape=21, color = "white", size=2, show.legend = F) +
+    ggplot2::geom_path(
+      data = 
+        pd_neg %>% 
+        filter(sample_variance != "other") %>% 
+        group_by(sample_variance) %>% 
+        arrange(time_point) %>% ungroup(),
+      aes(
+        x = .data[[xvar]], 
+        y = .data[[yvar]],
+        color = sample_variance),
+        show.legend = F) +#, color="black"
+    ggplot2::labs(fill = "Random donor", 
+                  x = paste0(xvar, " (", variance_explained[xvar], " %)"), 
+                  y = paste0(yvar, " (", variance_explained[yvar], " %)"))+
+    scale_color_manual(values = c("#e4211cff", "#4daf4aff", "#b250b5ff"))+
+    ggplot2::scale_fill_manual(values = c("#d9d9d9ff", "#e4211cff", "#4daf4aff", "#b250b5ff"))+
+    ggplot2::theme_minimal() +
+    ggplot2::theme(axis.title.x = element_text(size = 7),
+                   axis.title.y = element_text(size = 7),
+                   axis.text.x = element_text(size = 7),
+                   axis.text.y = element_text(size = 7),
+                   legend.text = element_text(size = 7),
+                   legend.title = element_text(size=7),
+                   panel.grid.major = element_blank(),
+                   panel.grid.minor = element_blank())+
+  guides(fill = guide_legend(reverse=TRUE))
+  
+  p2_neg <-
+    ggplot2::ggplot(pd_neg, ggplot2::aes(x=.data[[xvar]], y=.data[[yvar]], fill=status))+
+    ggplot2::geom_point(shape=21, color = "white", size=2, show.legend = T) +#, color="black"
+    ggplot2::labs(fill = "Status", 
+                  x = paste0(xvar, " (", variance_explained[xvar], " %)")[1], 
+                  y = paste0(yvar, " (", variance_explained[yvar], " %)")
+                  )+
+    ggsci::scale_fill_d3()+
+    ggplot2::theme_minimal() +
+    ggplot2::theme(axis.title.x = element_text(size = 7),
+                   axis.title.y = element_text(size = 7),
+                   axis.text.x = element_text(size = 7),
+                   axis.text.y = element_text(size = 7),
+                   legend.text = element_text(size = 7),
+                   legend.title = element_text(size=7),
+                   panel.grid.major = element_blank(),
+                   panel.grid.minor = element_blank())
+  
+  plotlist[[length(plotlist)+1]] <- p1_neg
+}
+
+p1 <- cowplot::plot_grid(plotlist = plotlist, nrow=1)
+p1 <- cowplot::plot_grid(p1)#, legend, rel_widths = c(3, .4))
+title <- cowplot::ggdraw() + cowplot::draw_label(paste("PCA based on", ncol(x), "Features"), size = 8)
+
+final <- cowplot::plot_grid(title, p1, nrow=2, rel_heights = c(1, 10))
+
+ggsave(filename = "/data/projects/osteoporosis_metabolomics/johan/figures/sample_variance_neg.pdf",
+       plot=final,
+       bg = "white", width = 183, height = 90, units = "mm")
+```
+
+
+```{r}
+
+library(patchwork)
+
+pca_analysis <- (p2_pos|p2_neg)/(p1_pos|p1_neg) + plot_layout(guides = "collect")
+
+ggsave(filename = "/data/projects/osteoporosis_metabolomics/johan/figures/figure1_pca_analysis.pdf",
+       plot=pca_analysis,
+       bg = "white", width = 160, height = 110, units = "mm")
+
+```
